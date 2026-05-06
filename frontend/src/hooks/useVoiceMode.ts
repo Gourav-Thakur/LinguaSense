@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// Web Speech API isn't in standard DOM types; webkit-prefixed in Safari.
-type SR = any;
+// SpeechSynthesis is in the standard DOM types; SpeechRecognition isn't (we
+// don't use it any more — STT is now server-side via Whisper).
 
 export interface VoiceOption {
   uri: string;
@@ -12,29 +12,32 @@ export interface VoiceOption {
   lang: string;
 }
 
+export type SttLanguage = "auto" | "en" | "hi" | "kn";
+
 interface UseVoiceMode {
   supported: boolean;
   active: boolean;
   listening: boolean;
   speaking: boolean;
-  interim: string;
+  processing: boolean;
+  level: number; // 0..1, mic input level for the meter
   voices: VoiceOption[];
   voiceURI: string | null;
   setVoiceURI: (uri: string) => void;
-  start: () => void;
+  language: SttLanguage;
+  setLanguage: (l: SttLanguage) => void;
+  start: () => Promise<void>;
   stop: () => void;
   speak: (text: string) => void;
   cancelSpeech: () => void;
+  errorMessage: string | null;
 }
 
 interface Options {
   onFinalTranscript: (text: string) => void;
-  lang?: string;
+  transcribeUrl?: string;
 }
 
-// Highest-priority installed female voices we know about, by name fragment.
-// Premium / Enhanced variants come first because they sound markedly more
-// natural than the legacy compact voices.
 const PREFERRED_VOICE_NAMES = [
   "Ava (Premium)",
   "Ava (Enhanced)",
@@ -69,96 +72,76 @@ function pickPreferredVoice(all: SpeechSynthesisVoice[]): SpeechSynthesisVoice |
   return pool[0] ?? null;
 }
 
+// Energy-based VAD tuning
+const SAMPLE_INTERVAL_MS = 60;
+const SPEECH_RMS_THRESHOLD = 0.03;
+const SILENCE_RMS_THRESHOLD = 0.018;
+const MIN_SPEECH_MS = 350;
+const SILENCE_HANGOVER_MS = 750;
+const MAX_UTTERANCE_MS = 15000;
+
+function pickRecorderMime(): string | undefined {
+  if (typeof MediaRecorder === "undefined") return undefined;
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  return candidates.find((m) => MediaRecorder.isTypeSupported(m));
+}
+
 export function useVoiceMode({
   onFinalTranscript,
-  lang = "en-IN",
+  transcribeUrl = "http://localhost:8000/api/transcribe",
 }: Options): UseVoiceMode {
   const [supported, setSupported] = useState(false);
   const [active, setActive] = useState(false);
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
-  const [interim, setInterim] = useState("");
+  const [processing, setProcessing] = useState(false);
+  const [level, setLevel] = useState(0);
   const [voices, setVoices] = useState<VoiceOption[]>([]);
   const [voiceURI, setVoiceURI] = useState<string | null>(null);
+  const [language, setLanguage] = useState<SttLanguage>("auto");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const recRef = useRef<SR | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recorderMimeRef = useRef<string | undefined>(undefined);
+  const chunksRef = useRef<Blob[]>([]);
+  const vadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const utteranceStartRef = useRef<number | null>(null);
+  const lastSpeechAtRef = useRef<number>(0);
   const activeRef = useRef(false);
   const speakingRef = useRef(false);
+  const sendingRef = useRef(false);
+  const languageRef = useRef<SttLanguage>("auto");
+  useEffect(() => {
+    languageRef.current = language;
+  }, [language]);
+
   const synthVoicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const onFinalRef = useRef(onFinalTranscript);
   useEffect(() => {
     onFinalRef.current = onFinalTranscript;
   }, [onFinalTranscript]);
 
-  // ---- Recognition setup -------------------------------------------------
+  // ---- Capability detection ---------------------------------------------
   useEffect(() => {
     if (typeof window === "undefined") return;
     const w = window as any;
-    const Ctor = w.SpeechRecognition || w.webkitSpeechRecognition;
-    const synth: SpeechSynthesis | undefined = w.speechSynthesis;
-    if (!Ctor || !synth) {
-      setSupported(false);
-      return;
-    }
-    setSupported(true);
+    const ok =
+      typeof navigator !== "undefined" &&
+      !!navigator.mediaDevices?.getUserMedia &&
+      typeof MediaRecorder !== "undefined" &&
+      !!w.speechSynthesis;
+    setSupported(ok);
+  }, []);
 
-    const rec: SR = new Ctor();
-    rec.lang = lang;
-    rec.interimResults = true;
-    rec.continuous = true;
-
-    rec.onresult = (event: any) => {
-      let interimText = "";
-      let finalText = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const res = event.results[i];
-        if (res.isFinal) finalText += res[0].transcript;
-        else interimText += res[0].transcript;
-      }
-      if (interimText) setInterim(interimText.trim());
-      const trimmedFinal = finalText.trim();
-      if (trimmedFinal) {
-        setInterim("");
-        onFinalRef.current(trimmedFinal);
-      }
-    };
-
-    rec.onerror = (e: any) => {
-      // "no-speech" is fine in continuous mode — silence happens.
-      // "aborted" fires when we deliberately stop. Both are routine.
-      if (e.error !== "no-speech" && e.error !== "aborted") {
-        console.warn("speech recognition error:", e.error);
-      }
-    };
-
-    rec.onend = () => {
-      setListening(false);
-      // Browsers stop continuous recognition after long silences. If the
-      // conversation is still active and the agent isn't currently speaking,
-      // restart automatically.
-      if (activeRef.current && !speakingRef.current) {
-        try {
-          rec.start();
-          setListening(true);
-        } catch {
-          // Already started; another tick will retry on next onend.
-        }
-      }
-    };
-
-    recRef.current = rec;
-
-    return () => {
-      try {
-        rec.abort();
-      } catch {
-        /* ignore */
-      }
-      synth.cancel();
-    };
-  }, [lang]);
-
-  // ---- Voice list (async — voices may load after a tick) -----------------
+  // ---- TTS voice list ---------------------------------------------------
   useEffect(() => {
     if (typeof window === "undefined") return;
     const synth: SpeechSynthesis | undefined = (window as any).speechSynthesis;
@@ -167,9 +150,7 @@ export function useVoiceMode({
     const refresh = () => {
       const list = synth.getVoices();
       synthVoicesRef.current = list;
-      setVoices(
-        list.map((v) => ({ uri: v.voiceURI, name: v.name, lang: v.lang })),
-      );
+      setVoices(list.map((v) => ({ uri: v.voiceURI, name: v.name, lang: v.lang })));
       setVoiceURI((current) => {
         if (current && list.some((v) => v.voiceURI === current)) return current;
         const picked = pickPreferredVoice(list);
@@ -179,40 +160,191 @@ export function useVoiceMode({
 
     refresh();
     synth.addEventListener?.("voiceschanged", refresh);
-    return () => {
-      synth.removeEventListener?.("voiceschanged", refresh);
+    return () => synth.removeEventListener?.("voiceschanged", refresh);
+  }, []);
+
+  // ---- Recorder lifecycle ------------------------------------------------
+
+  const startRecorder = useCallback(() => {
+    const stream = streamRef.current;
+    if (!stream) return;
+    if (recorderRef.current && recorderRef.current.state !== "inactive") return;
+    chunksRef.current = [];
+    const mime = recorderMimeRef.current;
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
     };
+    rec.onstop = () => {
+      const blob = new Blob(chunksRef.current, {
+        type: mime || "audio/webm",
+      });
+      chunksRef.current = [];
+      utteranceStartRef.current = null;
+      void sendForTranscription(blob);
+    };
+    rec.start();
+    recorderRef.current = rec;
+    setListening(true);
+  }, []);
+
+  const stopRecorder = useCallback(() => {
+    const rec = recorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try {
+        rec.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    recorderRef.current = null;
+    setListening(false);
+  }, []);
+
+  const sendForTranscription = useCallback(
+    async (blob: Blob) => {
+      if (!blob.size) return;
+      sendingRef.current = true;
+      setProcessing(true);
+      try {
+        const fd = new FormData();
+        const ext = (recorderMimeRef.current || "audio/webm").includes("mp4")
+          ? "mp4"
+          : "webm";
+        fd.append("audio", blob, `utterance.${ext}`);
+        fd.append("language", languageRef.current);
+        const res = await fetch(transcribeUrl, { method: "POST", body: fd });
+        if (!res.ok) {
+          const detail = (await res.json().catch(() => null))?.detail;
+          throw new Error(detail || `transcribe failed: ${res.status}`);
+        }
+        const data = (await res.json()) as { text: string; language?: string };
+        const text = (data.text || "").trim();
+        if (text) onFinalRef.current(text);
+      } catch (exc: any) {
+        console.warn("transcribe error:", exc?.message || exc);
+        setErrorMessage(exc?.message || "Transcription failed");
+        setTimeout(() => setErrorMessage(null), 3500);
+      } finally {
+        sendingRef.current = false;
+        setProcessing(false);
+        // Resume listening if the conversation is still active and the agent
+        // isn't speaking right now.
+        if (activeRef.current && !speakingRef.current && streamRef.current) {
+          startRecorder();
+        }
+      }
+    },
+    [startRecorder, transcribeUrl],
+  );
+
+  // ---- Energy VAD --------------------------------------------------------
+
+  const startVad = useCallback(() => {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    const buffer = new Uint8Array(analyser.fftSize);
+
+    if (vadTimerRef.current) clearInterval(vadTimerRef.current);
+    vadTimerRef.current = setInterval(() => {
+      analyser.getByteTimeDomainData(buffer);
+      let sumSquares = 0;
+      for (let i = 0; i < buffer.length; i++) {
+        const norm = (buffer[i] - 128) / 128;
+        sumSquares += norm * norm;
+      }
+      const rms = Math.sqrt(sumSquares / buffer.length);
+      setLevel(rms);
+
+      if (!activeRef.current || speakingRef.current || sendingRef.current) {
+        return;
+      }
+      const rec = recorderRef.current;
+      if (!rec || rec.state !== "recording") return;
+
+      const now = performance.now();
+      if (rms > SPEECH_RMS_THRESHOLD) {
+        if (utteranceStartRef.current == null) utteranceStartRef.current = now;
+        lastSpeechAtRef.current = now;
+      }
+      const startedAt = utteranceStartRef.current;
+      if (startedAt != null) {
+        const speechMs = now - startedAt;
+        const silenceMs = now - lastSpeechAtRef.current;
+        const longEnough = speechMs >= MIN_SPEECH_MS;
+        const shouldStop =
+          (longEnough && rms < SILENCE_RMS_THRESHOLD && silenceMs >= SILENCE_HANGOVER_MS) ||
+          speechMs >= MAX_UTTERANCE_MS;
+        if (shouldStop) {
+          stopRecorder();
+        }
+      }
+    }, SAMPLE_INTERVAL_MS);
+  }, [stopRecorder]);
+
+  const stopVad = useCallback(() => {
+    if (vadTimerRef.current) {
+      clearInterval(vadTimerRef.current);
+      vadTimerRef.current = null;
+    }
+    setLevel(0);
   }, []);
 
   // ---- Public actions ----------------------------------------------------
 
-  const start = useCallback(() => {
-    const rec = recRef.current;
-    if (!rec) return;
-    activeRef.current = true;
-    setActive(true);
-    if (speakingRef.current) return; // will resume after speech ends
+  const start = useCallback(async () => {
+    if (activeRef.current) return;
+    setErrorMessage(null);
     try {
-      rec.start();
-      setListening(true);
-    } catch {
-      // Already running.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      streamRef.current = stream;
+      const ctx = new (window.AudioContext ||
+        (window as any).webkitAudioContext)();
+      audioCtxRef.current = ctx;
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+      recorderMimeRef.current = pickRecorderMime();
+
+      activeRef.current = true;
+      setActive(true);
+      startRecorder();
+      startVad();
+    } catch (exc: any) {
+      console.warn("getUserMedia failed:", exc?.message || exc);
+      setErrorMessage(
+        "Could not access the microphone. Check the browser permission and try again.",
+      );
     }
-  }, []);
+  }, [startRecorder, startVad]);
 
   const stop = useCallback(() => {
-    const rec = recRef.current;
     activeRef.current = false;
     setActive(false);
-    setInterim("");
-    if (!rec) return;
-    try {
-      rec.stop();
-    } catch {
-      /* ignore */
-    }
     setListening(false);
-  }, []);
+    setLevel(0);
+    stopVad();
+    stopRecorder();
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    if (audioCtxRef.current) {
+      try {
+        audioCtxRef.current.close();
+      } catch {
+        /* ignore */
+      }
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+  }, [stopRecorder, stopVad]);
 
   const cancelSpeech = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -220,15 +352,10 @@ export function useVoiceMode({
     synth?.cancel();
     speakingRef.current = false;
     setSpeaking(false);
-    if (activeRef.current) {
-      try {
-        recRef.current?.start();
-        setListening(true);
-      } catch {
-        /* already running */
-      }
+    if (activeRef.current && streamRef.current && !sendingRef.current) {
+      startRecorder();
     }
-  }, []);
+  }, [startRecorder]);
 
   const speak = useCallback(
     (text: string) => {
@@ -236,13 +363,7 @@ export function useVoiceMode({
       const synth: SpeechSynthesis | undefined = (window as any).speechSynthesis;
       if (!synth) return;
 
-      // Mute the mic so the agent doesn't transcribe itself.
-      try {
-        recRef.current?.stop();
-      } catch {
-        /* ignore */
-      }
-      setListening(false);
+      stopRecorder();
 
       synth.cancel();
       const utter = new (window as any).SpeechSynthesisUtterance(text);
@@ -251,57 +372,55 @@ export function useVoiceMode({
         utter.voice = chosen;
         utter.lang = chosen.lang;
       } else {
-        utter.lang = lang;
+        utter.lang = "en-IN";
       }
       utter.rate = 1.0;
-      utter.pitch = 1.05; // tiny lift away from the default robotic baseline
+      utter.pitch = 1.05;
 
       utter.onstart = () => {
         speakingRef.current = true;
         setSpeaking(true);
       };
-      utter.onend = () => {
+      const finish = () => {
         speakingRef.current = false;
         setSpeaking(false);
-        if (activeRef.current) {
-          try {
-            recRef.current?.start();
-            setListening(true);
-          } catch {
-            /* already running */
-          }
+        if (activeRef.current && streamRef.current && !sendingRef.current) {
+          startRecorder();
         }
       };
-      utter.onerror = () => {
-        speakingRef.current = false;
-        setSpeaking(false);
-        if (activeRef.current) {
-          try {
-            recRef.current?.start();
-            setListening(true);
-          } catch {
-            /* already running */
-          }
-        }
-      };
-
+      utter.onend = finish;
+      utter.onerror = finish;
       synth.speak(utter);
     },
-    [lang, voiceURI],
+    [voiceURI, startRecorder, stopRecorder],
   );
+
+  // Cleanup if the component unmounts mid-call.
+  useEffect(() => {
+    return () => {
+      stopVad();
+      stopRecorder();
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      audioCtxRef.current?.close().catch(() => {});
+    };
+  }, [stopRecorder, stopVad]);
 
   return {
     supported,
     active,
     listening,
     speaking,
-    interim,
+    processing,
+    level,
     voices,
     voiceURI,
     setVoiceURI,
+    language,
+    setLanguage,
     start,
     stop,
     speak,
     cancelSpeech,
+    errorMessage,
   };
 }

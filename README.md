@@ -8,9 +8,28 @@ the live transcript + extracted state to a human-operator dashboard.
 
 ## Stack
 
-- **Backend:** FastAPI + WebSocket, `google-generativeai` (Gemini 1.5 Flash),
-  `pipecat-ai` pipeline scaffold for future audio (Sarvam AI / Bhashini).
+- **Backend:** FastAPI + WebSocket, dual-provider LLM (custom HTTP endpoints
+  with failover, or Gemini), `faster-whisper` for multilingual STT,
+  `pipecat-ai` pipeline scaffold for future Sarvam/Bhashini integration.
 - **Frontend:** Next.js 14 (App Router) + TypeScript + Tailwind CSS.
+  Browser-side audio capture (MediaRecorder + energy VAD) and natural female
+  TTS via SpeechSynthesis.
+
+## Voice mode
+
+Caller speech is captured in the browser, segmented by an energy-based VAD,
+and POSTed to `/api/transcribe` where Whisper runs locally. The chosen
+language ("Auto-detect", English, Hindi, or Kannada) is forwarded to
+Whisper. Agent replies are spoken back via the browser's TTS, which auto-
+selects the best installed female voice (Ava / Allison / Samantha on
+macOS, Aria / Jenny / Zira on Windows).
+
+The Whisper model (default `small`, ~480 MB) is downloaded once on the
+first backend start and cached at `~/.cache/huggingface/hub/`. Subsequent
+starts reuse the cache. To upgrade for better Kannada accuracy:
+```
+WHISPER_MODEL=medium  # ~1.5 GB, in backend/.env
+```
 
 ## Setup
 
@@ -34,6 +53,11 @@ GEMINI_MODEL=gemini-2.5-flash
 
 # CORS origin for the dashboard
 FRONTEND_ORIGIN=http://localhost:3000
+
+# Whisper STT (downloaded once on first run)
+WHISPER_MODEL=small          # tiny | base | small | medium | large-v3
+WHISPER_DEVICE=cpu           # cpu | cuda | auto
+WHISPER_COMPUTE_TYPE=int8    # int8 | int8_float16 | float16 | float32
 ```
 
 Copy `frontend/.env.local.example` to `frontend/.env.local` (defaults work).

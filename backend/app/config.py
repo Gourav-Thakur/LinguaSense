@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
 
+    # Whisper STT (faster-whisper). The model is downloaded once on first
+    # backend start and cached at ~/.cache/huggingface/hub/.
+    # Sizes: tiny~75MB, base~140MB, small~480MB, medium~1.5GB, large-v3~3GB.
+    whisper_model: str = "small"
+    whisper_device: str = "cpu"          # "cpu" | "cuda" | "auto"
+    whisper_compute_type: str = "int8"   # "int8" | "int8_float16" | "float16" | "float32"
+
     # Future STT/TTS keys (unused for now)
     sarvam_api_key: str = ""
     bhashini_user_id: str = ""

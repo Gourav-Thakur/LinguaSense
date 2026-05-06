@@ -1,12 +1,15 @@
 """FastAPI app + WebSocket dispatcher for the Chameleon Stealth Protocol."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import transcribe
 from .config import settings
 from .schemas import (
     WSAlertMessage,
@@ -21,7 +24,17 @@ from .stealth import merge_extracted, resolve_stealth
 log = logging.getLogger("chameleon")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Chameleon Stealth Protocol")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Whisper model is heavy: load it on startup so the first transcribe
+    # request doesn't time out. Run in a thread so the event loop isn't
+    # blocked while the (one-time) model download happens.
+    asyncio.create_task(asyncio.to_thread(transcribe.state.load))
+    yield
+
+
+app = FastAPI(title="Chameleon Stealth Protocol", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,8 +46,46 @@ app.add_middleware(
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, bool]:
-    return {"ok": True, "gemini_configured": bool(settings.gemini_api_key)}
+async def healthz() -> dict[str, object]:
+    return {
+        "ok": True,
+        "gemini_configured": bool(settings.gemini_api_key),
+        "stt_ready": transcribe.state.ready,
+        "stt_loading": transcribe.state.loading,
+        "stt_error": transcribe.state.error,
+        "stt_model": settings.whisper_model,
+    }
+
+
+@app.post("/api/transcribe")
+async def transcribe_endpoint(
+    audio: UploadFile = File(...),
+    language: str = Form("auto"),
+) -> dict[str, str]:
+    """Accept a single utterance audio blob, return the recognized text.
+
+    The frontend records a webm/opus blob via MediaRecorder (Safari sends
+    mp4/aac). faster-whisper feeds the bytes through PyAV which handles
+    both formats transparently.
+    """
+    if not transcribe.state.ready:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "STT model is still loading. Try again in a moment."
+                if transcribe.state.loading
+                else (transcribe.state.error or "STT not initialized")
+            ),
+        )
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="empty audio payload")
+    try:
+        text, detected = await transcribe.transcribe(audio_bytes, language)
+    except Exception as exc:
+        log.exception("transcribe failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"text": text, "language": detected}
 
 
 GREETING = (

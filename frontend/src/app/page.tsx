@@ -8,6 +8,7 @@ import { ExtractionCard } from "@/components/ExtractionCard";
 import { StealthBanner } from "@/components/StealthBanner";
 import { TranscriptWindow } from "@/components/TranscriptWindow";
 import { VoicePanel } from "@/components/VoicePanel";
+import { useBackendHealth } from "@/hooks/useBackendHealth";
 import { useDispatcherSocket } from "@/hooks/useDispatcherSocket";
 import { useVoiceMode } from "@/hooks/useVoiceMode";
 
@@ -23,9 +24,10 @@ export default function DashboardPage() {
     endCall,
   } = useDispatcherSocket();
 
+  const health = useBackendHealth();
+
   const voice = useVoiceMode({
     onFinalTranscript: (text) => sendUserMessage(text),
-    lang: "en-IN",
   });
 
   // Auto-speak each NEW assistant line. Cursor advances regardless of voice
@@ -41,7 +43,7 @@ export default function DashboardPage() {
     lastSpokenIdx.current = transcript.length - 1;
   }, [transcript, voice, callEnded]);
 
-  // When the human operator ends the call, kill the voice loop too.
+  // When the operator ends the call, kill voice loop too.
   useEffect(() => {
     if (callEnded) {
       voice.stop();
@@ -93,10 +95,17 @@ export default function DashboardPage() {
           active={voice.active}
           listening={voice.listening}
           speaking={voice.speaking}
-          interim={voice.interim}
+          processing={voice.processing}
+          level={voice.level}
           disabled={inputDisabled}
+          sttReady={health.stt_ready}
+          sttLoading={health.stt_loading}
+          sttModel={health.stt_model}
+          errorMessage={voice.errorMessage}
           voices={voice.voices}
           voiceURI={voice.voiceURI}
+          language={voice.language}
+          onLanguageChange={voice.setLanguage}
           onVoiceURIChange={voice.setVoiceURI}
           onStart={voice.start}
           onStop={voice.stop}
