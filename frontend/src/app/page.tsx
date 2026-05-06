@@ -1,11 +1,15 @@
 "use client";
 
+import { useEffect, useRef } from "react";
+
 import { CallerSimulator } from "@/components/CallerSimulator";
 import { EndCallPanel } from "@/components/EndCallPanel";
 import { ExtractionCard } from "@/components/ExtractionCard";
 import { StealthBanner } from "@/components/StealthBanner";
 import { TranscriptWindow } from "@/components/TranscriptWindow";
+import { VoicePanel } from "@/components/VoicePanel";
 import { useDispatcherSocket } from "@/hooks/useDispatcherSocket";
+import { useVoiceMode } from "@/hooks/useVoiceMode";
 
 export default function DashboardPage() {
   const {
@@ -18,6 +22,34 @@ export default function DashboardPage() {
     sendUserMessage,
     endCall,
   } = useDispatcherSocket();
+
+  const voice = useVoiceMode({
+    onFinalTranscript: (text) => sendUserMessage(text),
+    lang: "en-IN",
+  });
+
+  // Auto-speak each NEW assistant line. Cursor advances regardless of voice
+  // state so toggling voice on later doesn't replay history.
+  const lastSpokenIdx = useRef(-1);
+  useEffect(() => {
+    for (let i = lastSpokenIdx.current + 1; i < transcript.length; i++) {
+      const line = transcript[i];
+      if (voice.active && !callEnded && line.role === "assistant") {
+        voice.speak(line.text);
+      }
+    }
+    lastSpokenIdx.current = transcript.length - 1;
+  }, [transcript, voice, callEnded]);
+
+  // When the human operator ends the call, kill the voice loop too.
+  useEffect(() => {
+    if (callEnded) {
+      voice.stop();
+      voice.cancelSpeech();
+    }
+  }, [callEnded, voice]);
+
+  const inputDisabled = !connected || callEnded;
 
   return (
     <main className="h-screen flex flex-col overflow-hidden">
@@ -55,10 +87,24 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      <div className="p-4 pt-0">
+      <div className="p-4 pt-0 space-y-3">
+        <VoicePanel
+          supported={voice.supported}
+          active={voice.active}
+          listening={voice.listening}
+          speaking={voice.speaking}
+          interim={voice.interim}
+          disabled={inputDisabled}
+          voices={voice.voices}
+          voiceURI={voice.voiceURI}
+          onVoiceURIChange={voice.setVoiceURI}
+          onStart={voice.start}
+          onStop={voice.stop}
+          onCancelSpeech={voice.cancelSpeech}
+        />
         <CallerSimulator
           onSend={sendUserMessage}
-          disabled={!connected || callEnded}
+          disabled={inputDisabled}
           callEnded={callEnded}
         />
       </div>
