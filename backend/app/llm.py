@@ -49,6 +49,7 @@ class LLMUnavailable(RuntimeError):
 class _Turn:
     role: str  # "caller" | "you"
     text: str
+    language: str | None = None  # ISO-639-1 ("en" | "hi" | "kn") or None
 
 
 def _render(history: list[_Turn]) -> str:
@@ -59,11 +60,15 @@ def _render(history: list[_Turn]) -> str:
         )
     lines = ["This is the ongoing emergency-line conversation:\n"]
     for t in history:
-        speaker = "Caller" if t.role == "caller" else "You (dispatcher)"
-        lines.append(f"{speaker}: {t.text}")
+        if t.role == "caller":
+            tag = f"[{t.language}]" if t.language else "[auto]"
+            lines.append(f"Caller {tag}: {t.text}")
+        else:
+            lines.append(f"You (dispatcher): {t.text}")
     lines.append(
         "\nProduce your NEXT dispatcher turn now, as a single JSON object per "
-        "the schema in the system prompt."
+        "the schema in the system prompt. Reply in the SAME language as the "
+        "most recent caller turn (per LANGUAGE POLICY)."
     )
     return "\n".join(lines)
 
@@ -165,8 +170,8 @@ class DispatcherChat:
     history: list[_Turn] = field(default_factory=list)
     provider: _Provider = field(default_factory=_build_provider)
 
-    async def turn(self, user_text: str) -> ParsedTurn:
-        self.history.append(_Turn(role="caller", text=user_text))
+    async def turn(self, user_text: str, language: str | None = None) -> ParsedTurn:
+        self.history.append(_Turn(role="caller", text=user_text, language=language))
         rendered = _render(self.history)
         try:
             raw = await self.provider.generate(rendered, SYSTEM_PROMPT + JSON_TAIL)

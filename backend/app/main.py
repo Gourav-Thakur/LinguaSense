@@ -122,7 +122,15 @@ async def ws_dispatch(websocket: WebSocket) -> None:
 
             mtype = msg.get("type")
             if mtype == "user_message":
-                await _handle_user_message(websocket, session, str(msg.get("text", "")).strip())
+                lang = msg.get("language")
+                if lang and lang not in {"en", "hi", "kn"}:
+                    lang = None
+                await _handle_user_message(
+                    websocket,
+                    session,
+                    str(msg.get("text", "")).strip(),
+                    lang,
+                )
             elif mtype == "request_summary":
                 await _handle_summary(websocket, session)
             else:
@@ -132,7 +140,10 @@ async def ws_dispatch(websocket: WebSocket) -> None:
 
 
 async def _handle_user_message(
-    websocket: WebSocket, session: ConversationSession, text: str
+    websocket: WebSocket,
+    session: ConversationSession,
+    text: str,
+    language: str | None = None,
 ) -> None:
     if not text:
         return
@@ -140,7 +151,7 @@ async def _handle_user_message(
     session.append("user", text)
     await _send(websocket, WSTranscriptMessage(role="user", text=text))
 
-    parsed = await session.chat.turn(text)
+    parsed = await session.chat.turn(text, language=language)
 
     new_stealth = resolve_stealth(parsed, text, session.stealth_mode)
     just_engaged = new_stealth and not session.stealth_mode

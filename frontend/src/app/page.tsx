@@ -27,7 +27,7 @@ export default function DashboardPage() {
   const health = useBackendHealth();
 
   const voice = useVoiceMode({
-    onFinalTranscript: (text) => sendUserMessage(text),
+    onFinalTranscript: (text, language) => sendUserMessage(text, language),
   });
 
   // Auto-speak each NEW assistant line. Cursor advances regardless of voice

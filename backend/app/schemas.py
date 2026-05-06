@@ -75,6 +75,7 @@ class WSErrorMessage(BaseModel):
 class WSUserMessageIn(BaseModel):
     type: Literal["user_message"]
     text: str
+    language: str | None = None  # "en" | "hi" | "kn" | None ("auto"/unknown)
 
 
 class WSRequestSummaryIn(BaseModel):

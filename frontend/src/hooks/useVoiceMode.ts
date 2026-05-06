@@ -34,8 +34,16 @@ interface UseVoiceMode {
 }
 
 interface Options {
-  onFinalTranscript: (text: string) => void;
+  onFinalTranscript: (text: string, language: string | null) => void;
   transcribeUrl?: string;
+}
+
+// Detect the script of a string. Used to pick a matching TTS voice for the
+// agent's reply when the LLM responds in Hindi or Kannada.
+function detectScript(text: string): "devanagari" | "kannada" | "latin" {
+  if (/[ऀ-ॿ]/.test(text)) return "devanagari";
+  if (/[ಀ-೿]/.test(text)) return "kannada";
+  return "latin";
 }
 
 const PREFERRED_VOICE_NAMES = [
@@ -71,6 +79,29 @@ function pickPreferredVoice(all: SpeechSynthesisVoice[]): SpeechSynthesisVoice |
   }
   return pool[0] ?? null;
 }
+
+// For Hindi / Kannada replies, prefer an installed female voice for that
+// language. macOS ships "Lekha" (hi-IN). Windows has "Microsoft Heera",
+// "Microsoft Kalpana", "Microsoft Hemant" (hi-IN). Kannada (kn-IN) is
+// only on a few systems — fall back to setting just `lang` and letting
+// the OS pick if no exact-locale voice exists.
+function pickLocaleVoice(
+  all: SpeechSynthesisVoice[],
+  langPrefix: string,
+  preferredNames: string[],
+): SpeechSynthesisVoice | null {
+  const localized = all.filter((v) =>
+    v.lang?.toLowerCase().startsWith(langPrefix),
+  );
+  for (const name of preferredNames) {
+    const hit = localized.find((v) => v.name.includes(name));
+    if (hit) return hit;
+  }
+  return localized[0] ?? null;
+}
+
+const HINDI_PREFERRED = ["Lekha", "Microsoft Heera", "Microsoft Kalpana"];
+const KANNADA_PREFERRED = ["Soumya", "Microsoft"];
 
 // Energy-based VAD tuning
 const SAMPLE_INTERVAL_MS = 60;
@@ -220,7 +251,15 @@ export function useVoiceMode({
         }
         const data = (await res.json()) as { text: string; language?: string };
         const text = (data.text || "").trim();
-        if (text) onFinalRef.current(text);
+        if (text) {
+          // Whisper returns ISO codes; constrain to en/hi/kn or null.
+          const detected = data.language?.toLowerCase();
+          const lang =
+            detected === "en" || detected === "hi" || detected === "kn"
+              ? detected
+              : null;
+          onFinalRef.current(text, lang);
+        }
       } catch (exc: any) {
         console.warn("transcribe error:", exc?.message || exc);
         setErrorMessage(exc?.message || "Transcription failed");
@@ -367,12 +406,28 @@ export function useVoiceMode({
 
       synth.cancel();
       const utter = new (window as any).SpeechSynthesisUtterance(text);
-      const chosen = synthVoicesRef.current.find((v) => v.voiceURI === voiceURI);
-      if (chosen) {
-        utter.voice = chosen;
-        utter.lang = chosen.lang;
+
+      // Pick a voice that matches the script of THIS reply. The user's
+      // chosen English voice is only used when the reply is in Latin script;
+      // for Hindi/Kannada we look up a locale-matched voice (Lekha,
+      // Microsoft Heera, etc.) so Devanagari text doesn't get butchered.
+      const script = detectScript(text);
+      let voice: SpeechSynthesisVoice | null = null;
+      let fallbackLang = "en-IN";
+      if (script === "devanagari") {
+        voice = pickLocaleVoice(synthVoicesRef.current, "hi", HINDI_PREFERRED);
+        fallbackLang = "hi-IN";
+      } else if (script === "kannada") {
+        voice = pickLocaleVoice(synthVoicesRef.current, "kn", KANNADA_PREFERRED);
+        fallbackLang = "kn-IN";
       } else {
-        utter.lang = "en-IN";
+        voice = synthVoicesRef.current.find((v) => v.voiceURI === voiceURI) ?? null;
+      }
+      if (voice) {
+        utter.voice = voice;
+        utter.lang = voice.lang;
+      } else {
+        utter.lang = fallbackLang;
       }
       utter.rate = 1.0;
       utter.pitch = 1.05;

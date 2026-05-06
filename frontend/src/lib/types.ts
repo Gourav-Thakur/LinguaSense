@@ -31,7 +31,7 @@ export type ServerMessage =
   | { type: "error"; message: string };
 
 export type ClientMessage =
-  | { type: "user_message"; text: string }
+  | { type: "user_message"; text: string; language?: string | null }
   | { type: "request_summary" };
 
 export const EMPTY_STATE: SessionState = {

@@ -20,7 +20,7 @@ interface UseDispatcherSocket {
   alert: string | null;
   error: string | null;
   callEnded: boolean;
-  sendUserMessage: (text: string) => void;
+  sendUserMessage: (text: string, language?: string | null) => void;
   endCall: () => void;
 }
 
@@ -116,11 +116,11 @@ export function useDispatcherSocket(): UseDispatcherSocket {
   }, []);
 
   const sendUserMessage = useCallback(
-    (text: string) => {
+    (text: string, language?: string | null) => {
       if (callEndedRef.current) return;
       const trimmed = text.trim();
       if (!trimmed) return;
-      send({ type: "user_message", text: trimmed });
+      send({ type: "user_message", text: trimmed, language: language ?? null });
     },
     [send],
   );
