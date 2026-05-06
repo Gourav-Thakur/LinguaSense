@@ -1,0 +1,28 @@
+# Python
+backend/venv/
+backend/.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Env
+.env
+.env.local
+.env.example
+backend/.env
+frontend/.env.local
+
+# Node / Next
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
