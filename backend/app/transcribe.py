@@ -16,9 +16,18 @@ from .config import settings
 
 log = logging.getLogger(__name__)
 
+# The dispatcher only handles these three languages end-to-end (the LLM
+# replies in them, the TTS layer has voices for them). Whisper has 99
+# possible languages, so when the operator picks "auto" we still constrain
+# detection to this set — otherwise a noisy or accented utterance can be
+# mis-classified as e.g. Bengali / Marathi / Tamil and produce gibberish
+# downstream. See _detect_constrained.
+ALLOWED_LANGUAGES = ("en", "hi", "kn")
+DEFAULT_LANGUAGE = "en"
+
 # Whisper language codes we expose to the frontend dropdown.
 SUPPORTED_LANGUAGES = {
-    "auto": None,  # let Whisper detect
+    "auto": None,  # let Whisper detect (constrained to ALLOWED_LANGUAGES)
     "en": "en",
     "hi": "hi",
     "kn": "kn",
@@ -83,19 +92,60 @@ def _approximate_size(model_name: str) -> str:
     }.get(model_name, "(size depends on model)")
 
 
+def _detect_constrained(model, audio) -> str:
+    """Pick the most-likely language from ALLOWED_LANGUAGES only.
+
+    `audio` is a numpy float32 array sampled at 16 kHz (faster-whisper's
+    `decode_audio` returns this shape). `detect_language` returns the
+    full distribution; we discard everything outside our supported set
+    and fall back to DEFAULT_LANGUAGE if none of the three even
+    registers (which only happens on truly garbage input).
+    """
+    try:
+        _, _, all_probs = model.detect_language(audio=audio, vad_filter=True)
+    except Exception:
+        log.exception("language detection failed; defaulting to %s", DEFAULT_LANGUAGE)
+        return DEFAULT_LANGUAGE
+
+    best_code = DEFAULT_LANGUAGE
+    best_prob = -1.0
+    for code, prob in all_probs:
+        if code in ALLOWED_LANGUAGES and prob > best_prob:
+            best_code = code
+            best_prob = prob
+    log.info(
+        "constrained language detect -> %s (prob=%.2f among %s)",
+        best_code, max(best_prob, 0.0), ALLOWED_LANGUAGES,
+    )
+    return best_code
+
+
 def _transcribe_sync(audio_bytes: bytes, language: str | None) -> tuple[str, str]:
     """Run Whisper inference and return (text, detected_language).
 
     `vad_filter=True` strips long silences before the segments are decoded,
     which is critical for browser-recorded audio that may contain trailing
     silence captured by the energy-based VAD on the client side.
+
+    When `language` is None we run a constrained detection step first so
+    the final transcribe is always anchored to one of the three supported
+    languages (en/hi/kn), never something unsupported like Bengali or
+    Tamil that the rest of the pipeline can't handle.
     """
     if not state.ready or state.model is None:
         raise RuntimeError("Whisper model is not ready yet")
 
+    # Decode once; reuse the array for both detect_language and transcribe.
+    from faster_whisper.audio import decode_audio
+
+    audio_array = decode_audio(io.BytesIO(audio_bytes), sampling_rate=16000)
+
+    if language is None:
+        language = _detect_constrained(state.model, audio_array)
+
     segments, info = state.model.transcribe(
-        io.BytesIO(audio_bytes),
-        language=language,                # None => auto-detect
+        audio_array,
+        language=language,                 # always one of ALLOWED_LANGUAGES now
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 300},
         beam_size=1,                       # snappier on CPU; still good for short utterances
