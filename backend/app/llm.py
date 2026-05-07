@@ -42,6 +42,43 @@ class LLMUnavailable(RuntimeError):
     """Raised when every configured provider/endpoint has been exhausted."""
 
 
+class InvalidLLMResponse(RuntimeError):
+    """Raised when the model output cannot be parsed into a ParsedTurn.
+
+    Caller is expected to retry; if all retries fail, fall back to a
+    graceful in-character recovery line via _recovery_parsed.
+    """
+
+
+# Per-language graceful recovery phrases, used only when the LLM has failed
+# multiple times in a row. The TTS layer auto-detects script and picks a
+# matching voice. These never expose JSON, raw output, or "(no response)"
+# to the caller.
+_RECOVERY_PHRASES = {
+    "en": "Sorry, the line broke up there. Could you say that again?",
+    "hi": "माफ़ कीजिए, कनेक्शन में थोड़ी रुकावट आई। क्या आप एक बार फिर कह सकते हैं?",
+    "kn": "ಕ್ಷಮಿಸಿ, ಲೈನ್ ಒಂದು ಕ್ಷಣ ಕಟ್ ಆಯಿತು. ಇನ್ನೊಮ್ಮೆ ಹೇಳಬಲ್ಲಿರಾ?",
+}
+
+
+def _recovery_reply(language: str | None) -> str:
+    code = language if language in _RECOVERY_PHRASES else "en"
+    return _RECOVERY_PHRASES[code]
+
+
+def _recovery_parsed(language: str | None) -> ParsedTurn:
+    """Synthetic ParsedTurn used when every retry fails. stealth_mode is
+    False here on purpose — main.py's resolve_stealth keeps the prior
+    session.stealth_mode value once it's been engaged, so a momentary
+    LLM failure won't drop us out of cover."""
+    return ParsedTurn(
+        stealth_mode=False,
+        persona="dispatcher",
+        extracted_delta=ExtractedDelta(),
+        reply=_recovery_reply(language),
+    )
+
+
 # --------------------------------------------------------------------------
 # Conversation history (shared across providers)
 
@@ -173,26 +210,50 @@ class DispatcherChat:
     async def turn(self, user_text: str, language: str | None = None) -> ParsedTurn:
         self.history.append(_Turn(role="caller", text=user_text, language=language))
         rendered = _render(self.history)
-        try:
-            raw = await self.provider.generate(rendered, SYSTEM_PROMPT + JSON_TAIL)
-        except LLMUnavailable as exc:
-            log.error("LLM unavailable: %s", exc)
-            return ParsedTurn(
-                stealth_mode=False,
-                persona="dispatcher",
-                extracted_delta=ExtractedDelta(),
-                reply=f"(System error contacting model: {exc})",
-            )
-        except Exception as exc:
-            log.exception("LLM call failed")
-            return ParsedTurn(
-                stealth_mode=False,
-                persona="dispatcher",
-                extracted_delta=ExtractedDelta(),
-                reply=f"(System error contacting model: {exc})",
-            )
 
-        parsed = _safe_parse(raw)
+        # Two failure modes to handle:
+        #   1. provider raises LLMUnavailable (network / 5xx / all endpoints
+        #      exhausted) — already retried inside the provider; nothing more
+        #      we can do, fall back to the recovery line.
+        #   2. provider returns 200 but body is truncated / empty / not JSON —
+        #      retry the whole call up to MAX_PARSE_ATTEMPTS times before
+        #      falling back. This is what fixes the truncated-JSON-in-
+        #      transcript and the "(no response)" symptom.
+        MAX_PARSE_ATTEMPTS = 3
+        last_err: str | None = None
+
+        for attempt in range(MAX_PARSE_ATTEMPTS):
+            try:
+                raw = await self.provider.generate(rendered, SYSTEM_PROMPT + JSON_TAIL)
+            except LLMUnavailable as exc:
+                log.error("LLM unavailable: %s", exc)
+                parsed = _recovery_parsed(language)
+                self.history.append(_Turn(role="you", text=parsed.reply))
+                return parsed
+            except Exception as exc:
+                log.exception("LLM call failed")
+                parsed = _recovery_parsed(language)
+                self.history.append(_Turn(role="you", text=parsed.reply))
+                return parsed
+
+            try:
+                parsed = _safe_parse(raw)
+            except InvalidLLMResponse as exc:
+                last_err = str(exc)
+                log.warning(
+                    "LLM returned unparseable output (attempt %d/%d): %s",
+                    attempt + 1, MAX_PARSE_ATTEMPTS, exc,
+                )
+                continue  # ask the model again
+
+            self.history.append(_Turn(role="you", text=parsed.reply))
+            return parsed
+
+        log.error(
+            "LLM produced unparseable output after %d attempts: %s",
+            MAX_PARSE_ATTEMPTS, last_err,
+        )
+        parsed = _recovery_parsed(language)
         self.history.append(_Turn(role="you", text=parsed.reply))
         return parsed
 
@@ -209,8 +270,13 @@ class DispatcherChat:
 # Parsing
 
 def _safe_parse(raw: str) -> ParsedTurn:
-    """Tolerate small model deviations: stray code fences, trailing prose."""
+    """Parse the model's text into a ParsedTurn. Raises InvalidLLMResponse
+    on every failure mode (empty body, truncated JSON, missing fields) so
+    the caller can retry instead of leaking raw model output to the user.
+    """
     cleaned = (raw or "").strip()
+    if not cleaned:
+        raise InvalidLLMResponse("empty response body")
 
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
@@ -227,22 +293,20 @@ def _safe_parse(raw: str) -> ParsedTurn:
 
     try:
         data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        log.warning("Non-JSON response from LLM: %r", raw[:200])
-        return ParsedTurn(
-            stealth_mode=False,
-            persona="dispatcher",
-            extracted_delta=ExtractedDelta(),
-            reply=raw or "(no response)",
-        )
+    except json.JSONDecodeError as exc:
+        # Most common shape: response was cut off mid-stream. We log the
+        # prefix so we can spot upstream truncation in production.
+        raise InvalidLLMResponse(f"non-JSON / truncated: {raw[:120]!r}") from exc
+
+    if not isinstance(data, dict):
+        raise InvalidLLMResponse(f"top-level not an object: {type(data).__name__}")
 
     try:
-        return ParsedTurn.model_validate(data)
-    except Exception:
-        log.warning("Malformed ParsedTurn from LLM: %r", data)
-        return ParsedTurn(
-            stealth_mode=bool(data.get("stealth_mode", False)),
-            persona=str(data.get("persona", "dispatcher")),
-            extracted_delta=ExtractedDelta(),
-            reply=str(data.get("reply", "(malformed model response)")),
-        )
+        parsed = ParsedTurn.model_validate(data)
+    except Exception as exc:
+        raise InvalidLLMResponse(f"schema mismatch: {data!r}") from exc
+
+    if not parsed.reply or not parsed.reply.strip():
+        raise InvalidLLMResponse("reply field is empty")
+
+    return parsed
