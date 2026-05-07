@@ -1,10 +1,8 @@
 """FastAPI app + WebSocket dispatcher for the Chameleon Stealth Protocol."""
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,16 +23,7 @@ log = logging.getLogger("chameleon")
 logging.basicConfig(level=logging.INFO)
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    # Whisper model is heavy: load it on startup so the first transcribe
-    # request doesn't time out. Run in a thread so the event loop isn't
-    # blocked while the (one-time) model download happens.
-    asyncio.create_task(asyncio.to_thread(transcribe.state.load))
-    yield
-
-
-app = FastAPI(title="Chameleon Stealth Protocol", lifespan=lifespan)
+app = FastAPI(title="Chameleon Stealth Protocol")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,7 +42,8 @@ async def healthz() -> dict[str, object]:
         "stt_ready": transcribe.state.ready,
         "stt_loading": transcribe.state.loading,
         "stt_error": transcribe.state.error,
-        "stt_model": settings.whisper_model,
+        "stt_provider": "sarvam",
+        "stt_model": settings.sarvam_stt_model,
     }
 
 
@@ -62,20 +52,15 @@ async def transcribe_endpoint(
     audio: UploadFile = File(...),
     language: str = Form("auto"),
 ) -> dict[str, str]:
-    """Accept a single utterance audio blob, return the recognized text.
+    """Accept a single utterance audio blob, forward to Sarvam Saarika.
 
     The frontend records a webm/opus blob via MediaRecorder (Safari sends
-    mp4/aac). faster-whisper feeds the bytes through PyAV which handles
-    both formats transparently.
+    mp4/aac). Sarvam's STT API accepts either; we forward the raw bytes.
     """
     if not transcribe.state.ready:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "STT model is still loading. Try again in a moment."
-                if transcribe.state.loading
-                else (transcribe.state.error or "STT not initialized")
-            ),
+            detail=transcribe.state.error or "STT not configured",
         )
     audio_bytes = await audio.read()
     if not audio_bytes:

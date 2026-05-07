@@ -3,8 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// SpeechSynthesis is in the standard DOM types; SpeechRecognition isn't (we
-// don't use it any more — STT is now server-side via Whisper).
 
 export interface VoiceOption {
   uri: string;
@@ -16,18 +14,19 @@ export type SttLanguage = "auto" | "en" | "hi" | "kn";
 
 interface UseVoiceMode {
   supported: boolean;
-  active: boolean;
-  listening: boolean;
+  enabled: boolean;
+  pushing: boolean;
   speaking: boolean;
   processing: boolean;
-  level: number; // 0..1, mic input level for the meter
+  level: number;
   voices: VoiceOption[];
   voiceURI: string | null;
   setVoiceURI: (uri: string) => void;
   language: SttLanguage;
   setLanguage: (l: SttLanguage) => void;
-  start: () => Promise<void>;
-  stop: () => void;
+  setEnabled: (v: boolean) => void;
+  pushStart: () => Promise<void>;
+  pushEnd: () => void;
   speak: (text: string) => void;
   cancelSpeech: () => void;
   errorMessage: string | null;
@@ -38,35 +37,14 @@ interface Options {
   transcribeUrl?: string;
 }
 
-// Detect the script of a string. Used to pick a matching TTS voice for the
-// agent's reply when the LLM responds in Hindi or Kannada.
-function detectScript(text: string): "devanagari" | "kannada" | "latin" {
-  if (/[ऀ-ॿ]/.test(text)) return "devanagari";
-  if (/[ಀ-೿]/.test(text)) return "kannada";
-  return "latin";
-}
-
 const PREFERRED_VOICE_NAMES = [
-  "Ava (Premium)",
-  "Ava (Enhanced)",
-  "Ava",
-  "Allison (Premium)",
-  "Allison (Enhanced)",
-  "Allison",
-  "Samantha (Premium)",
-  "Samantha (Enhanced)",
-  "Samantha",
-  "Karen (Premium)",
-  "Karen (Enhanced)",
-  "Karen",
-  "Tessa",
-  "Moira",
-  "Microsoft Aria",
-  "Microsoft Jenny",
-  "Microsoft Zira",
-  "Microsoft Hazel",
-  "Google UK English Female",
-  "Google US English",
+  "Ava (Premium)", "Ava (Enhanced)", "Ava",
+  "Allison (Premium)", "Allison (Enhanced)", "Allison",
+  "Samantha (Premium)", "Samantha (Enhanced)", "Samantha",
+  "Karen (Premium)", "Karen (Enhanced)", "Karen",
+  "Tessa", "Moira",
+  "Microsoft Aria", "Microsoft Jenny", "Microsoft Zira", "Microsoft Hazel",
+  "Google UK English Female", "Google US English",
 ];
 
 function pickPreferredVoice(all: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
@@ -80,19 +58,12 @@ function pickPreferredVoice(all: SpeechSynthesisVoice[]): SpeechSynthesisVoice |
   return pool[0] ?? null;
 }
 
-// For Hindi / Kannada replies, prefer an installed female voice for that
-// language. macOS ships "Lekha" (hi-IN). Windows has "Microsoft Heera",
-// "Microsoft Kalpana", "Microsoft Hemant" (hi-IN). Kannada (kn-IN) is
-// only on a few systems — fall back to setting just `lang` and letting
-// the OS pick if no exact-locale voice exists.
 function pickLocaleVoice(
   all: SpeechSynthesisVoice[],
   langPrefix: string,
   preferredNames: string[],
 ): SpeechSynthesisVoice | null {
-  const localized = all.filter((v) =>
-    v.lang?.toLowerCase().startsWith(langPrefix),
-  );
+  const localized = all.filter((v) => v.lang?.toLowerCase().startsWith(langPrefix));
   for (const name of preferredNames) {
     const hit = localized.find((v) => v.name.includes(name));
     if (hit) return hit;
@@ -103,13 +74,11 @@ function pickLocaleVoice(
 const HINDI_PREFERRED = ["Lekha", "Microsoft Heera", "Microsoft Kalpana"];
 const KANNADA_PREFERRED = ["Soumya", "Microsoft"];
 
-// Energy-based VAD tuning
-const SAMPLE_INTERVAL_MS = 60;
-const SPEECH_RMS_THRESHOLD = 0.03;
-const SILENCE_RMS_THRESHOLD = 0.018;
-const MIN_SPEECH_MS = 350;
-const SILENCE_HANGOVER_MS = 750;
-const MAX_UTTERANCE_MS = 15000;
+function detectScript(text: string): "devanagari" | "kannada" | "latin" {
+  if (/[ऀ-ॿ]/.test(text)) return "devanagari";
+  if (/[ಀ-೿]/.test(text)) return "kannada";
+  return "latin";
+}
 
 function pickRecorderMime(): string | undefined {
   if (typeof MediaRecorder === "undefined") return undefined;
@@ -122,13 +91,21 @@ function pickRecorderMime(): string | undefined {
   return candidates.find((m) => MediaRecorder.isTypeSupported(m));
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (target.isContentEditable) return true;
+  return false;
+}
+
 export function useVoiceMode({
   onFinalTranscript,
   transcribeUrl = "http://localhost:8000/api/transcribe",
 }: Options): UseVoiceMode {
   const [supported, setSupported] = useState(false);
-  const [active, setActive] = useState(false);
-  const [listening, setListening] = useState(false);
+  const [enabled, setEnabledState] = useState(false);
+  const [pushing, setPushing] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [level, setLevel] = useState(0);
@@ -143,22 +120,17 @@ export function useVoiceMode({
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recorderMimeRef = useRef<string | undefined>(undefined);
   const chunksRef = useRef<Blob[]>([]);
-  const vadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const utteranceStartRef = useRef<number | null>(null);
-  const lastSpeechAtRef = useRef<number>(0);
-  const activeRef = useRef(false);
+  const meterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const enabledRef = useRef(false);
+  const pushingRef = useRef(false);
   const speakingRef = useRef(false);
   const sendingRef = useRef(false);
   const languageRef = useRef<SttLanguage>("auto");
-  useEffect(() => {
-    languageRef.current = language;
-  }, [language]);
+  useEffect(() => { languageRef.current = language; }, [language]);
 
   const synthVoicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const onFinalRef = useRef(onFinalTranscript);
-  useEffect(() => {
-    onFinalRef.current = onFinalTranscript;
-  }, [onFinalTranscript]);
+  useEffect(() => { onFinalRef.current = onFinalTranscript; }, [onFinalTranscript]);
 
   // ---- Capability detection ---------------------------------------------
   useEffect(() => {
@@ -194,43 +166,56 @@ export function useVoiceMode({
     return () => synth.removeEventListener?.("voiceschanged", refresh);
   }, []);
 
-  // ---- Recorder lifecycle ------------------------------------------------
+  // ---- Mic stream lifecycle (opened lazily on first push) ----------------
 
-  const startRecorder = useCallback(() => {
-    const stream = streamRef.current;
-    if (!stream) return;
-    if (recorderRef.current && recorderRef.current.state !== "inactive") return;
-    chunksRef.current = [];
-    const mime = recorderMimeRef.current;
-    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-    rec.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-    };
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, {
-        type: mime || "audio/webm",
-      });
-      chunksRef.current = [];
-      utteranceStartRef.current = null;
-      void sendForTranscription(blob);
-    };
-    rec.start();
-    recorderRef.current = rec;
-    setListening(true);
-  }, []);
+  const ensureStream = useCallback(async () => {
+    if (streamRef.current) return streamRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    streamRef.current = stream;
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    audioCtxRef.current = ctx;
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    analyserRef.current = analyser;
+    recorderMimeRef.current = pickRecorderMime();
 
-  const stopRecorder = useCallback(() => {
-    const rec = recorderRef.current;
-    if (rec && rec.state !== "inactive") {
-      try {
-        rec.stop();
-      } catch {
-        /* ignore */
+    // Mic-level meter while pushing.
+    if (meterTimerRef.current) clearInterval(meterTimerRef.current);
+    const buf = new Uint8Array(analyser.fftSize);
+    meterTimerRef.current = setInterval(() => {
+      if (!pushingRef.current) { setLevel(0); return; }
+      analyser.getByteTimeDomainData(buf);
+      let s = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const n = (buf[i] - 128) / 128;
+        s += n * n;
       }
-    }
-    recorderRef.current = null;
-    setListening(false);
+      setLevel(Math.sqrt(s / buf.length));
+    }, 60);
+
+    return stream;
   }, []);
+
+  const teardownStream = useCallback(() => {
+    if (meterTimerRef.current) {
+      clearInterval(meterTimerRef.current);
+      meterTimerRef.current = null;
+    }
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch { /* ignore */ }
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+    setLevel(0);
+  }, []);
+
+  // ---- Sending recorded audio --------------------------------------------
 
   const sendForTranscription = useCallback(
     async (blob: Blob) => {
@@ -239,9 +224,7 @@ export function useVoiceMode({
       setProcessing(true);
       try {
         const fd = new FormData();
-        const ext = (recorderMimeRef.current || "audio/webm").includes("mp4")
-          ? "mp4"
-          : "webm";
+        const ext = (recorderMimeRef.current || "audio/webm").includes("mp4") ? "mp4" : "webm";
         fd.append("audio", blob, `utterance.${ext}`);
         fd.append("language", languageRef.current);
         const res = await fetch(transcribeUrl, { method: "POST", body: fd });
@@ -252,12 +235,9 @@ export function useVoiceMode({
         const data = (await res.json()) as { text: string; language?: string };
         const text = (data.text || "").trim();
         if (text) {
-          // Whisper returns ISO codes; constrain to en/hi/kn or null.
           const detected = data.language?.toLowerCase();
           const lang =
-            detected === "en" || detected === "hi" || detected === "kn"
-              ? detected
-              : null;
+            detected === "en" || detected === "hi" || detected === "kn" ? detected : null;
           onFinalRef.current(text, lang);
         }
       } catch (exc: any) {
@@ -267,123 +247,102 @@ export function useVoiceMode({
       } finally {
         sendingRef.current = false;
         setProcessing(false);
-        // Resume listening if the conversation is still active and the agent
-        // isn't speaking right now.
-        if (activeRef.current && !speakingRef.current && streamRef.current) {
-          startRecorder();
-        }
       }
     },
-    [startRecorder, transcribeUrl],
+    [transcribeUrl],
   );
 
-  // ---- Energy VAD --------------------------------------------------------
+  // ---- Push-to-talk actions ----------------------------------------------
 
-  const startVad = useCallback(() => {
-    const analyser = analyserRef.current;
-    if (!analyser) return;
-    const buffer = new Uint8Array(analyser.fftSize);
-
-    if (vadTimerRef.current) clearInterval(vadTimerRef.current);
-    vadTimerRef.current = setInterval(() => {
-      analyser.getByteTimeDomainData(buffer);
-      let sumSquares = 0;
-      for (let i = 0; i < buffer.length; i++) {
-        const norm = (buffer[i] - 128) / 128;
-        sumSquares += norm * norm;
-      }
-      const rms = Math.sqrt(sumSquares / buffer.length);
-      setLevel(rms);
-
-      if (!activeRef.current || speakingRef.current || sendingRef.current) {
-        return;
-      }
-      const rec = recorderRef.current;
-      if (!rec || rec.state !== "recording") return;
-
-      const now = performance.now();
-      if (rms > SPEECH_RMS_THRESHOLD) {
-        if (utteranceStartRef.current == null) utteranceStartRef.current = now;
-        lastSpeechAtRef.current = now;
-      }
-      const startedAt = utteranceStartRef.current;
-      if (startedAt != null) {
-        const speechMs = now - startedAt;
-        const silenceMs = now - lastSpeechAtRef.current;
-        const longEnough = speechMs >= MIN_SPEECH_MS;
-        const shouldStop =
-          (longEnough && rms < SILENCE_RMS_THRESHOLD && silenceMs >= SILENCE_HANGOVER_MS) ||
-          speechMs >= MAX_UTTERANCE_MS;
-        if (shouldStop) {
-          stopRecorder();
-        }
-      }
-    }, SAMPLE_INTERVAL_MS);
-  }, [stopRecorder]);
-
-  const stopVad = useCallback(() => {
-    if (vadTimerRef.current) {
-      clearInterval(vadTimerRef.current);
-      vadTimerRef.current = null;
+  const pushStart = useCallback(async () => {
+    if (!enabledRef.current) return;
+    if (pushingRef.current) return;
+    if (speakingRef.current) {
+      // Holding talk while the agent is speaking interrupts the agent
+      // (caller wants to break in). Cancel TTS, then start recording.
+      try { (window as any).speechSynthesis?.cancel(); } catch { /* ignore */ }
+      speakingRef.current = false;
+      setSpeaking(false);
     }
-    setLevel(0);
-  }, []);
-
-  // ---- Public actions ----------------------------------------------------
-
-  const start = useCallback(async () => {
-    if (activeRef.current) return;
     setErrorMessage(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      streamRef.current = stream;
-      const ctx = new (window.AudioContext ||
-        (window as any).webkitAudioContext)();
-      audioCtxRef.current = ctx;
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 1024;
-      source.connect(analyser);
-      analyserRef.current = analyser;
-      recorderMimeRef.current = pickRecorderMime();
-
-      activeRef.current = true;
-      setActive(true);
-      startRecorder();
-      startVad();
+      await ensureStream();
     } catch (exc: any) {
+      setErrorMessage("Could not access the microphone. Check the browser permission.");
       console.warn("getUserMedia failed:", exc?.message || exc);
-      setErrorMessage(
-        "Could not access the microphone. Check the browser permission and try again.",
-      );
+      return;
     }
-  }, [startRecorder, startVad]);
+    const stream = streamRef.current;
+    if (!stream) return;
 
-  const stop = useCallback(() => {
-    activeRef.current = false;
-    setActive(false);
-    setListening(false);
-    setLevel(0);
-    stopVad();
-    stopRecorder();
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    if (audioCtxRef.current) {
-      try {
-        audioCtxRef.current.close();
-      } catch {
-        /* ignore */
-      }
-      audioCtxRef.current = null;
+    chunksRef.current = [];
+    const mime = recorderMimeRef.current;
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    rec.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: mime || "audio/webm" });
+      chunksRef.current = [];
+      void sendForTranscription(blob);
+    };
+    rec.start();
+    recorderRef.current = rec;
+    pushingRef.current = true;
+    setPushing(true);
+  }, [ensureStream, sendForTranscription]);
+
+  const pushEnd = useCallback(() => {
+    if (!pushingRef.current) return;
+    pushingRef.current = false;
+    setPushing(false);
+    const rec = recorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      try { rec.stop(); } catch { /* ignore */ }
     }
-    analyserRef.current = null;
-  }, [stopRecorder, stopVad]);
+    recorderRef.current = null;
+  }, []);
+
+  // ---- Spacebar global shortcut (only while voice mode is enabled) ------
+
+  useEffect(() => {
+    if (!enabled) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== "Space") return;
+      if (e.repeat) return; // ignore key auto-repeat
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault(); // stop the page from scrolling
+      void pushStart();
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.code !== "Space") return;
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      pushEnd();
+    };
+    // Release if the window loses focus mid-press (otherwise mic stays hot)
+    const onBlur = () => pushEnd();
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [enabled, pushStart, pushEnd]);
+
+  const setEnabled = useCallback((v: boolean) => {
+    enabledRef.current = v;
+    setEnabledState(v);
+    if (!v) {
+      pushEnd();
+      teardownStream();
+    }
+  }, [pushEnd, teardownStream]);
+
+  // ---- TTS ---------------------------------------------------------------
 
   const cancelSpeech = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -391,10 +350,7 @@ export function useVoiceMode({
     synth?.cancel();
     speakingRef.current = false;
     setSpeaking(false);
-    if (activeRef.current && streamRef.current && !sendingRef.current) {
-      startRecorder();
-    }
-  }, [startRecorder]);
+  }, []);
 
   const speak = useCallback(
     (text: string) => {
@@ -402,15 +358,9 @@ export function useVoiceMode({
       const synth: SpeechSynthesis | undefined = (window as any).speechSynthesis;
       if (!synth) return;
 
-      stopRecorder();
-
       synth.cancel();
       const utter = new (window as any).SpeechSynthesisUtterance(text);
 
-      // Pick a voice that matches the script of THIS reply. The user's
-      // chosen English voice is only used when the reply is in Latin script;
-      // for Hindi/Kannada we look up a locale-matched voice (Lekha,
-      // Microsoft Heera, etc.) so Devanagari text doesn't get butchered.
       const script = detectScript(text);
       let voice: SpeechSynthesisVoice | null = null;
       let fallbackLang = "en-IN";
@@ -439,31 +389,26 @@ export function useVoiceMode({
       const finish = () => {
         speakingRef.current = false;
         setSpeaking(false);
-        if (activeRef.current && streamRef.current && !sendingRef.current) {
-          startRecorder();
-        }
       };
       utter.onend = finish;
       utter.onerror = finish;
       synth.speak(utter);
     },
-    [voiceURI, startRecorder, stopRecorder],
+    [voiceURI],
   );
 
-  // Cleanup if the component unmounts mid-call.
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopVad();
-      stopRecorder();
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      audioCtxRef.current?.close().catch(() => {});
+      pushEnd();
+      teardownStream();
     };
-  }, [stopRecorder, stopVad]);
+  }, [pushEnd, teardownStream]);
 
   return {
     supported,
-    active,
-    listening,
+    enabled,
+    pushing,
     speaking,
     processing,
     level,
@@ -472,8 +417,9 @@ export function useVoiceMode({
     setVoiceURI,
     language,
     setLanguage,
-    start,
-    stop,
+    setEnabled,
+    pushStart,
+    pushEnd,
     speak,
     cancelSpeech,
     errorMessage,

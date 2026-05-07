@@ -36,17 +36,17 @@ export default function DashboardPage() {
   useEffect(() => {
     for (let i = lastSpokenIdx.current + 1; i < transcript.length; i++) {
       const line = transcript[i];
-      if (voice.active && !callEnded && line.role === "assistant") {
+      if (voice.enabled && !callEnded && line.role === "assistant") {
         voice.speak(line.text);
       }
     }
     lastSpokenIdx.current = transcript.length - 1;
   }, [transcript, voice, callEnded]);
 
-  // When the operator ends the call, kill voice loop too.
+  // When the operator ends the call, kill voice mode too.
   useEffect(() => {
     if (callEnded) {
-      voice.stop();
+      voice.setEnabled(false);
       voice.cancelSpeech();
     }
   }, [callEnded, voice]);
@@ -92,14 +92,14 @@ export default function DashboardPage() {
       <div className="p-4 pt-0 space-y-3">
         <VoicePanel
           supported={voice.supported}
-          active={voice.active}
-          listening={voice.listening}
+          enabled={voice.enabled}
+          pushing={voice.pushing}
           speaking={voice.speaking}
           processing={voice.processing}
           level={voice.level}
           disabled={inputDisabled}
           sttReady={health.stt_ready}
-          sttLoading={health.stt_loading}
+          sttProvider={health.stt_provider}
           sttModel={health.stt_model}
           errorMessage={voice.errorMessage}
           voices={voice.voices}
@@ -107,8 +107,9 @@ export default function DashboardPage() {
           language={voice.language}
           onLanguageChange={voice.setLanguage}
           onVoiceURIChange={voice.setVoiceURI}
-          onStart={voice.start}
-          onStop={voice.stop}
+          onEnabledChange={voice.setEnabled}
+          onPushStart={voice.pushStart}
+          onPushEnd={voice.pushEnd}
           onCancelSpeech={voice.cancelSpeech}
         />
         <CallerSimulator

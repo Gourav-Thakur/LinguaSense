@@ -7,6 +7,7 @@ interface Health {
   stt_ready: boolean;
   stt_loading: boolean;
   stt_error: string | null;
+  stt_provider: string;
   stt_model: string;
 }
 
@@ -15,7 +16,8 @@ const DEFAULT: Health = {
   stt_ready: false,
   stt_loading: false,
   stt_error: null,
-  stt_model: "small",
+  stt_provider: "sarvam",
+  stt_model: "saarika:v2.5",
 };
 
 const HEALTH_URL =
@@ -39,7 +41,8 @@ export function useBackendHealth(): Health {
           stt_ready: !!data.stt_ready,
           stt_loading: !!data.stt_loading,
           stt_error: data.stt_error ?? null,
-          stt_model: data.stt_model || "small",
+          stt_provider: data.stt_provider || "sarvam",
+          stt_model: data.stt_model || "saarika:v2.5",
         });
         // Once STT is ready, slow the polling way down — we don't need to
         // hammer the endpoint forever.
