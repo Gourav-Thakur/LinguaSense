@@ -57,6 +57,7 @@ export function VoicePanel({
   onCancelSpeech,
 }: Props) {
   const [showVoices, setShowVoices] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
 
   if (!supported) {
     return (
@@ -76,16 +77,43 @@ export function VoicePanel({
         enabled ? "border-emerald-700/60" : "border-zinc-800"
       }`}
     >
-      <div className="px-4 py-2 border-b border-zinc-800 flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-emerald-300 uppercase tracking-wider">
-          Push-to-Talk · Sarvam STT
-        </h2>
-        <span className="text-[10px] text-zinc-500 italic truncate max-w-[55%]">
+      <button
+        type="button"
+        onClick={() => setCollapsed((c) => !c)}
+        className="w-full px-4 py-2 border-b border-zinc-800 flex items-center justify-between hover:bg-zinc-800/40 transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <Chevron open={!collapsed} />
+          <h2 className="text-sm font-semibold text-emerald-300 uppercase tracking-wider">
+            Push-to-Talk · Sarvam STT
+          </h2>
+          {collapsed && enabled && (
+            <span className="ml-2 text-[10px] uppercase tracking-widest text-emerald-400">
+              · spacebar still active
+            </span>
+          )}
+        </span>
+        <span className="text-[10px] text-zinc-500 italic truncate max-w-[45%] text-right">
           STT: {sttProvider} · {sttModel}
           {chosenVoice ? ` · TTS: ${chosenVoice.name}` : ""}
         </span>
-      </div>
+      </button>
 
+      {collapsed && (
+        <div className="px-4 py-2 flex items-center gap-3 text-[11px] text-zinc-400">
+          <Status label="MIC" active={pushing} color="red" />
+          <Status label="SARVAM" active={processing} color="amber" />
+          <Status label="AGENT" active={speaking} color="emerald" />
+          <div className="ml-auto flex-1 max-w-[40%] h-1.5 bg-zinc-800 rounded overflow-hidden">
+            <div
+              className="h-full bg-emerald-500 transition-all"
+              style={{ width: `${Math.min(100, level * 600)}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {!collapsed && (
       <div className="p-4 space-y-3">
         {!sttReady && (
           <div className="text-[11px] rounded bg-amber-900/30 border border-amber-700/40 text-amber-200 px-3 py-2">
@@ -215,7 +243,21 @@ export function VoicePanel({
           )}
         </div>
       </div>
+      )}
     </div>
+  );
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <span
+      className={`inline-block text-zinc-500 text-xs transition-transform ${
+        open ? "rotate-90" : ""
+      }`}
+      aria-hidden
+    >
+      ▶
+    </span>
   );
 }
 
