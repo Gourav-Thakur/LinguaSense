@@ -20,8 +20,7 @@ const DEFAULT: Health = {
   stt_model: "saarika:v2.5",
 };
 
-const HEALTH_URL =
-  process.env.NEXT_PUBLIC_HEALTH_URL || "http://localhost:8000/healthz";
+const HEALTH_URL = "/api/healthz";
 
 export function useBackendHealth(): Health {
   const [health, setHealth] = useState<Health>(DEFAULT);

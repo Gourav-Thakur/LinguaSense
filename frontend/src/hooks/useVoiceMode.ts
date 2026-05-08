@@ -101,7 +101,7 @@ function isTypingTarget(target: EventTarget | null): boolean {
 
 export function useVoiceMode({
   onFinalTranscript,
-  transcribeUrl = "http://localhost:8000/api/transcribe",
+  transcribeUrl = "/api/transcribe",
 }: Options): UseVoiceMode {
   const [supported, setSupported] = useState(false);
   const [enabled, setEnabledState] = useState(false);
@@ -229,7 +229,8 @@ export function useVoiceMode({
         fd.append("language", languageRef.current);
         const res = await fetch(transcribeUrl, { method: "POST", body: fd });
         if (!res.ok) {
-          const detail = (await res.json().catch(() => null))?.detail;
+          const body = await res.json().catch(() => null);
+          const detail = body?.error || body?.detail;
           throw new Error(detail || `transcribe failed: ${res.status}`);
         }
         const data = (await res.json()) as { text: string; language?: string };

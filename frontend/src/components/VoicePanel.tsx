@@ -118,8 +118,7 @@ export function VoicePanel({
         {!sttReady && (
           <div className="text-[11px] rounded bg-amber-900/30 border border-amber-700/40 text-amber-200 px-3 py-2">
             STT not ready — set <code className="font-mono">SARVAM_API_KEY</code>{" "}
-            in <code className="font-mono">backend/.env</code> and restart the
-            backend.
+            in <code className="font-mono">.env.local</code> and restart.
           </div>
         )}
         {errorMessage && (

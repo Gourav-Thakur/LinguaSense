@@ -9,12 +9,12 @@ import { StealthBanner } from "@/components/StealthBanner";
 import { TranscriptWindow } from "@/components/TranscriptWindow";
 import { VoicePanel } from "@/components/VoicePanel";
 import { useBackendHealth } from "@/hooks/useBackendHealth";
-import { useDispatcherSocket } from "@/hooks/useDispatcherSocket";
+import { useDispatcher } from "@/hooks/useDispatcher";
 import { useVoiceMode } from "@/hooks/useVoiceMode";
 
 export default function DashboardPage() {
   const {
-    connected,
+    loading,
     state,
     transcript,
     summary,
@@ -22,7 +22,7 @@ export default function DashboardPage() {
     callEnded,
     sendUserMessage,
     endCall,
-  } = useDispatcherSocket();
+  } = useDispatcher();
 
   const health = useBackendHealth();
 
@@ -30,8 +30,6 @@ export default function DashboardPage() {
     onFinalTranscript: (text, language) => sendUserMessage(text, language),
   });
 
-  // Auto-speak each NEW assistant line. Cursor advances regardless of voice
-  // state so toggling voice on later doesn't replay history.
   const lastSpokenIdx = useRef(-1);
   useEffect(() => {
     for (let i = lastSpokenIdx.current + 1; i < transcript.length; i++) {
@@ -43,7 +41,6 @@ export default function DashboardPage() {
     lastSpokenIdx.current = transcript.length - 1;
   }, [transcript, voice, callEnded]);
 
-  // When the operator ends the call, kill voice mode too.
   useEffect(() => {
     if (callEnded) {
       voice.setEnabled(false);
@@ -51,14 +48,14 @@ export default function DashboardPage() {
     }
   }, [callEnded, voice]);
 
-  const inputDisabled = !connected || callEnded;
+  const inputDisabled = loading || callEnded;
 
   return (
     <main className="h-screen flex flex-col overflow-hidden">
       <StealthBanner
         stealthMode={state.stealth_mode}
         persona={state.persona}
-        connected={connected}
+        connected={!loading}
       />
 
       {error && (

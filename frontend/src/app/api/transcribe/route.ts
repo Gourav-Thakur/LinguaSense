@@ -32,13 +32,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "empty audio payload" }, { status: 400 });
   }
 
+  // Re-create blob with a clean audio/webm MIME type (browser may send
+  // "audio/webm;codecs=opus" which some APIs reject).
   const audioBytes = await audioFile.arrayBuffer();
+  const audioBlob = new Blob([audioBytes], { type: "audio/webm" });
+
   const sarvamForm = new FormData();
-  sarvamForm.append(
-    "file",
-    new Blob([audioBytes], { type: audioFile.type || "audio/webm" }),
-    "utterance.webm"
-  );
+  sarvamForm.append("file", audioBlob, "utterance.webm");
   sarvamForm.append("model", process.env.SARVAM_STT_MODEL || "saarika:v2.5");
   sarvamForm.append("language_code", LANG_MAP[language] ?? "unknown");
 
@@ -50,8 +50,9 @@ export async function POST(req: NextRequest) {
 
   if (!res.ok) {
     const detail = await res.text();
+    console.error(`[transcribe] Sarvam ${res.status}:`, detail);
     return NextResponse.json(
-      { error: `Sarvam STT ${res.status}: ${detail.slice(0, 200)}` },
+      { error: `Sarvam ${res.status}: ${detail.slice(0, 300)}` },
       { status: 502 }
     );
   }
